@@ -26,7 +26,7 @@ Outputs:
     Description: Viewer Request lambda version ARN. Use with viewer-request CloudFront event trigger.
     Value: !Ref ViewerRequest.Version
   OriginRequestPolicy:
-    Description: Includes RTI, ja3/ja4 fingerprint, tls and host headers
+    Description: Includes RTI result, ja3/ja4 fingerprint, tls and host headers
     Value: !Sub "${AWS::StackName}-origin-request-policy"
   OriginRequestPolicyNoHost:
     Description: Includes RTI, ja3/ja4 fingerprint and tls headers, no host header
@@ -139,7 +139,7 @@ Resources:
             - referer
             - user-agent
             - x-forwarded-for
-            - true-client-ip
+            - x-cheq-rti-result # added by the Lambda; without it here CloudFront may drop it before the origin (quota: 10 headers, so true-client-ip was removed)
   # Use when the origin must NOT receive the Host header (e.g. S3 REST endpoint, origins that use
   # their own domain). Omitting host prevents CloudFront from sending the viewer's hostname to
   # the origin, which would cause request failures on origins that don't recognize it.
@@ -164,7 +164,7 @@ Resources:
             - referer
             - user-agent
             - x-forwarded-for
-            - true-client-ip
+            - x-cheq-rti-result # added by the Lambda; without it here CloudFront may drop it before the origin (quota: 10 headers, so true-client-ip was removed)
   # Same as NoHost but also forwards the custom header specified by the TrustedIPHeader parameter.
   # Only created when TrustedIPHeader is provided. The exact use case for TrustedIPHeader is unclear — carried over from the old repo without documentation.
   OriginRequestPolicyNoHostTrustedIP:
@@ -188,9 +188,8 @@ Resources:
             - accept-language
             - referer
             - user-agent
-            - !Ref TrustedIPHeader
-            - x-forwarded-for
-            - true-client-ip
+            - !Ref TrustedIPHeader # replaces x-forwarded-for / true-client-ip (quota: 10 headers)
+            - x-cheq-rti-result # added by the Lambda; without it here CloudFront may drop it before the origin
   # Same as the default policy (with host) but also forwards the custom header specified by the TrustedIPHeader parameter.
   # Only created when TrustedIPHeader is provided. The exact use case for TrustedIPHeader is unclear — carried over from the old repo without documentation.
   OriginRequestPolicyTrustedIP:
@@ -215,9 +214,8 @@ Resources:
             - host
             - referer
             - user-agent
-            - !Ref TrustedIPHeader
-            - x-forwarded-for
-            - true-client-ip
+            - !Ref TrustedIPHeader # replaces x-forwarded-for / true-client-ip (quota: 10 headers)
+            - x-cheq-rti-result # added by the Lambda; without it here CloudFront may drop it before the origin
   # Forwards all cookies, query strings, and all viewer/request headers to the origin. 
   # Use for maximum flexibility when testing or if the origin needs a wide range of headers and you don't want to manage updates to the header whitelist over time. 
   # Note that this will forward the Host header by default, which may not be suitable for all origins (e.g. S3 REST endpoints).

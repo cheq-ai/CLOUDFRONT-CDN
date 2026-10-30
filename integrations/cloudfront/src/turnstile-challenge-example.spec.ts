@@ -4,6 +4,7 @@ import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
 import { createTurnstileChallenge, TurnstileSettings } from './turnstile-challenge-example';
 import type { CloudFrontRequest } from 'aws-lambda/common/cloudfront';
 import type { RTIResponse } from '../../core/models/rti-response.model';
+import { HttpsClient } from '../../core/services/https-client';
 
 // Pass-through spy on timingSafeEqual, so a test can check the signature compare is constant-time.
 vi.mock('node:crypto', async (importOriginal) => {
@@ -74,13 +75,15 @@ function buildRTIResponse(rayId = 'ray-123'): RTIResponse {
     } as unknown as RTIResponse;
 }
 
-const solvedQuery = new URLSearchParams({ 'cf-turnstile-response': 'valid-token' }).toString();
+const solvedQuery = new URLSearchParams({ cheq_challenge: '1', 'cf-turnstile-response': 'valid-token' }).toString();
 
-const stubSiteverify = (success: boolean) => {
-    const fetchMock = vi.fn().mockResolvedValue({ json: async () => ({ success }) });
-    vi.stubGlobal('fetch', fetchMock);
-    return fetchMock;
-};
+// A siteverify answer for OUR widget (action) on example.com, the Host the redirect tests use.
+// siteverify goes through HttpsClient.post(body, timeoutMs); the stub answers like Cloudflare does.
+const stubSiteverify = (success: boolean, answer: Record<string, unknown> = {}) =>
+    vi.spyOn(HttpsClient.prototype, 'post').mockResolvedValue({
+        status: 200, statusText: 'OK', body: JSON.stringify({ success, action: 'cheq-challenge', hostname: 'example.com', ...answer }),
+    });
+const siteverifyBody = (post: ReturnType<typeof stubSiteverify>) => JSON.parse(post.mock.calls[0][0] as string);
 
 /**
  * Solves the challenge (siteverify stubbed to succeed) and returns the session cookie it issues, so the
@@ -289,10 +292,10 @@ describe('validateChallenge', () => {
     it.each([
         ['without a _cq_duid cookie', undefined],
         ['with a _cq_duid cookie', '_cq_duid=dev-A'],
-    ])('signs %s as HMAC-SHA256(secret, JSON ["se", expiresAt, rayId]), first 32 hex (known answer)', async (_label, cookie) => {
+    ])('signs %s as HMAC-SHA256(secret, JSON ["se", expiresAt, rayId, userAgent]), first 32 hex (known answer)', async (_label, cookie) => {
         const now = 1_700_000_000_000;
         const { signature, expiresAt } = await issueSession('ray-1', testSettings, now, cookie);
-        const signed = JSON.stringify(['se', now + 300_000, 'ray-1']);
+        const signed = JSON.stringify(['se', now + 300_000, 'ray-1', '']); // no User-Agent header on the issuing request
         const expected = createHmac('sha256', testSettings.sessionSigningSecret).update(signed).digest('hex').slice(0, 32);
         expect(expiresAt).toBe(now + 300_000);
         expect(signature).toBe(expected);
@@ -389,37 +392,35 @@ describe('challenge', () => {
         (request as any).uri = '/page"><script>alert(1)</script>';
         const result = await challenge(request, buildRTIResponse()) as any;
         expect(result.body).not.toContain('<script>alert(1)</script>');
-        expect(result.body).toContain('action="/page&quot;&gt;&lt;script&gt;alert(1)&lt;/script&gt;"');
-        expect(result.body).toContain('name="original_url" value="/page&quot;&gt;&lt;script&gt;alert(1)&lt;/script&gt;"');
+        expect(result.body).toContain('action="/page&quot;&gt;&lt;script&gt;alert(1)&lt;/script&gt;?cheq_challenge=1&amp;cheq_original_url=');
+        expect(result.body).toContain('name="cheq_original_url" id="cheq-original-url" value="/page&quot;&gt;&lt;script&gt;alert(1)&lt;/script&gt;"');
     });
 
     it("HTML-escapes the rayId and the site key (& < > \" ')", async () => {
         const result = await build({ ...testSettings, siteKey: `k"'<&>` }).challenge(buildTurnstileRequest(), buildRTIResponse(`r"'<&>`)) as any;
         expect(result.body).toContain('data-sitekey="k&quot;&#39;&lt;&amp;&gt;"');
-        expect(result.body).toContain('name="request_id" value="r&quot;&#39;&lt;&amp;&gt;"');
-        expect(result.body).toContain('<div class="ref-id">r&quot;&#39;&lt;&amp;&gt;</div>');
+        expect(result.body).toContain('name="cheq_request_id" value="r&quot;&#39;&lt;&amp;&gt;"');
+        expect(result.body).toContain('<code>r&quot;&#39;&lt;&amp;&gt;</code>');
         expect(result.body).not.toContain(`r"'<&>`);
     });
 
     it('leaves a normal URI and rayId unchanged', async () => {
         const result = await challenge(buildTurnstileRequest(), buildRTIResponse('ray-abc-123')) as any;
-        expect(result.body).toContain('action="/page"');
+        expect(result.body).toContain('action="/page?cheq_challenge=1&amp;cheq_original_url=%2Fpage"');
         expect(result.body).toContain('value="ray-abc-123"');
     });
 
     // --- Token present: verify with Turnstile ---
 
     it('sends the configured Turnstile secret to siteverify', async () => {
-        const fetchMock = stubSiteverify(true);
+        const post = stubSiteverify(true);
         await challenge(buildTurnstileRequest(solvedQuery), buildRTIResponse());
-        const body = new URLSearchParams(fetchMock.mock.calls[0][1].body);
-        expect(body.get('secret')).toBe('test-turnstile-secret');
-        expect(body.get('response')).toBe('valid-token');
+        expect(siteverifyBody(post)).toMatchObject({ secret: 'test-turnstile-secret', response: 'valid-token' });
     });
 
     it('returns 302 with session cookie when Turnstile verification succeeds', async () => {
         stubSiteverify(true);
-        const qs = new URLSearchParams({ 'cf-turnstile-response': 'valid-token', 'original_url': '/target' }).toString();
+        const qs = new URLSearchParams({ cheq_challenge: '1', 'cf-turnstile-response': 'valid-token', 'cheq_original_url': '/target' }).toString();
         const result = await challenge(buildTurnstileRequest(qs, 'example.com'), buildRTIResponse()) as any;
         expect(result.status).toBe('302');
         expect(result.headers.location[0].value).toBe('https://example.com/target');
@@ -434,18 +435,15 @@ describe('challenge', () => {
         expect(result.headers['set-cookie'][0].value).toMatch(/^_cq_se=\d+\.[0-9a-f]{32}\|ray-123; Path=\/; HttpOnly; Secure; SameSite=Lax; Max-Age=300$/);
     });
 
-    it('verifies the token with a form POST to Cloudflare siteverify, including the client IP', async () => {
-        const fetchMock = stubSiteverify(true);
+    it('verifies the token with a JSON POST to Cloudflare siteverify, including the client IP, within 1.5 s', async () => {
+        const post = stubSiteverify(true);
         await challenge(buildTurnstileRequest(solvedQuery), buildRTIResponse());
-        const [target, opts] = fetchMock.mock.calls[0];
-        expect(target).toBe('https://challenges.cloudflare.com/turnstile/v0/siteverify');
-        expect(opts.method).toBe('POST');
-        expect(opts.headers).toEqual({ 'Content-Type': 'application/x-www-form-urlencoded' });
-        expect(new URLSearchParams(opts.body).get('remoteip')).toBe('1.2.3.4');
+        expect(siteverifyBody(post)).toEqual({ secret: 'test-turnstile-secret', response: 'valid-token', remoteip: '1.2.3.4' });
+        expect(post.mock.calls[0][1]).toBe(1500);
     });
 
     it('rejects when the siteverify call fails (the handler then fails open)', async () => {
-        vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('siteverify unreachable')));
+        vi.spyOn(HttpsClient.prototype, 'post').mockRejectedValue(new Error('siteverify unreachable'));
         await expect(challenge(buildTurnstileRequest(solvedQuery), buildRTIResponse())).rejects.toThrow('siteverify unreachable');
     });
 
@@ -493,7 +491,7 @@ describe('challenge', () => {
 
     // --- Redirect target (as in Akamai's reCAPTCHA challenge: host from the request, path checked) ---
 
-    it('redirects to the Host header and the request URI when no original_url is given', async () => {
+    it('redirects to the Host header and the request URI when no cheq_original_url is given', async () => {
         stubSiteverify(true);
         const result = await challenge(buildTurnstileRequest(solvedQuery, 'example.com'), buildRTIResponse()) as any;
         expect(result.headers.location[0].value).toBe('https://example.com/page');
@@ -501,22 +499,22 @@ describe('challenge', () => {
 
     it('ignores a viewer_host query parameter (it used to set the redirect host: an open redirect)', async () => {
         stubSiteverify(true);
-        const qs = new URLSearchParams({ 'cf-turnstile-response': 'valid-token', 'viewer_host': 'evil.com', 'original_url': '/target' }).toString();
+        const qs = new URLSearchParams({ cheq_challenge: '1', 'cf-turnstile-response': 'valid-token', 'viewer_host': 'evil.com', 'cheq_original_url': '/target' }).toString();
         const result = await challenge(buildTurnstileRequest(qs, 'example.com'), buildRTIResponse()) as any;
         expect(result.headers.location[0].value).toBe('https://example.com/target');
     });
 
-    it('keeps the query string of an accepted original_url', async () => {
+    it('keeps the query string of an accepted cheq_original_url', async () => {
         stubSiteverify(true);
-        const qs = new URLSearchParams({ 'cf-turnstile-response': 'valid-token', 'original_url': '/search?q=shoes&page=2' }).toString();
+        const qs = new URLSearchParams({ cheq_challenge: '1', 'cf-turnstile-response': 'valid-token', 'cheq_original_url': '/search?q=shoes&page=2' }).toString();
         const result = await challenge(buildTurnstileRequest(qs, 'example.com'), buildRTIResponse()) as any;
         expect(result.headers.location[0].value).toBe('https://example.com/search?q=shoes&page=2');
     });
 
     it.each(['//evil.com', '/\\evil.com', 'https://evil.com/x', '@evil.com', '.evil.com', 'evil.com', ''])(
-        'rejects original_url %j and redirects to the request URI instead', async (originalUrl) => {
+        'rejects cheq_original_url %j and redirects to the request URI instead', async (originalUrl) => {
             stubSiteverify(true);
-            const qs = new URLSearchParams({ 'cf-turnstile-response': 'valid-token', 'original_url': originalUrl }).toString();
+            const qs = new URLSearchParams({ cheq_challenge: '1', 'cf-turnstile-response': 'valid-token', 'cheq_original_url': originalUrl }).toString();
             const result = await challenge(buildTurnstileRequest(qs, 'example.com'), buildRTIResponse()) as any;
             expect(result.headers.location[0].value).toBe('https://example.com/page');
         });
@@ -534,10 +532,332 @@ describe('challenge', () => {
 
     it('returns 403 with error message when Turnstile verification fails', async () => {
         stubSiteverify(false);
-        const qs = new URLSearchParams({ 'cf-turnstile-response': 'bad-token' }).toString();
+        const qs = new URLSearchParams({ cheq_challenge: '1', 'cf-turnstile-response': 'bad-token' }).toString();
         const result = await challenge(buildTurnstileRequest(qs), buildRTIResponse()) as any;
         expect(result.status).toBe('403');
         expect(result.body).toContain('Verification failed');
         expect(result.headers?.['set-cookie']).toBeUndefined();
+    });
+});
+
+describe('challenge flow hardening', () => {
+    const withUa = (request: CloudFrontRequest, ua: string) => {
+        request.headers['user-agent'] = [{ key: 'User-Agent', value: ua }];
+        return request;
+    };
+
+    // Issue 5: query string after the challenge
+
+    it('keeps the query string in the return URL of the challenge page', async () => {
+        const result = await challenge(buildTurnstileRequest('utm_source=google&gclid=TeSt123'), buildRTIResponse()) as any;
+        expect(result.body).toContain('name="cheq_original_url" id="cheq-original-url" value="/page?utm_source=google&amp;gclid=TeSt123"');
+        expect(result.body).toContain('action="/page?cheq_challenge=1&amp;cheq_original_url=%2Fpage%3Futm_source%3Dgoogle%26gclid%3DTeSt123"');
+    });
+
+    it('redirects to the original path and query once solved', async () => {
+        stubSiteverify(true);
+        const qs = new URLSearchParams({ cheq_challenge: '1', 'cheq_original_url': '/page?utm_source=google&gclid=TeSt123', 'cf-turnstile-response': 'valid-token' }).toString();
+        const result = await challenge(buildTurnstileRequest(qs, 'example.com'), buildRTIResponse()) as any;
+        expect(result.headers.location[0].value).toBe('https://example.com/page?utm_source=google&gclid=TeSt123');
+    });
+
+    // Issue 7: control characters in cheq_original_url
+
+    it.each(['/\t/evil.com', '/\n/evil.com', '/\r/evil.com', '/x\u0000y', '/\u007f/evil.com'])(
+        'rejects cheq_original_url %j (browsers strip tab/CR/LF, turning it protocol-relative)', async (originalUrl) => {
+            stubSiteverify(true);
+            const qs = new URLSearchParams({ cheq_challenge: '1', 'cf-turnstile-response': 'valid-token', 'cheq_original_url': originalUrl }).toString();
+            const result = await challenge(buildTurnstileRequest(qs), buildRTIResponse()) as any;
+            expect(result.headers.location[0].value).toBe('/page');
+        });
+
+    // Issue 8: siteverify errors and the failed-verification page
+
+    it('throws (handler fails open) when siteverify answers non-2xx', async () => {
+        vi.spyOn(HttpsClient.prototype, 'post').mockResolvedValue({ status: 500, statusText: 'Internal Server Error', body: '{}' });
+        await expect(challenge(buildTurnstileRequest(solvedQuery), buildRTIResponse())).rejects.toThrow('HTTP 500');
+    });
+
+    it('throws (handler fails open) when siteverify returns a body that is not JSON', async () => {
+        vi.spyOn(HttpsClient.prototype, 'post').mockResolvedValue({ status: 200, statusText: 'OK', body: '<html>Bad gateway</html>' });
+        await expect(challenge(buildTurnstileRequest(solvedQuery), buildRTIResponse())).rejects.toThrow('Unexpected token');
+    });
+
+    it('does not use fetch for siteverify (undici hung after a Lambda freeze: 503)', async () => {
+        const fetchSpy = vi.fn();
+        vi.stubGlobal('fetch', fetchSpy);
+        stubSiteverify(true);
+        await challenge(buildTurnstileRequest(solvedQuery), buildRTIResponse());
+        expect(fetchSpy).not.toHaveBeenCalled();
+    });
+
+    it('shows the widget again with an error after a failed verification (no dead end), not cacheable', async () => {
+        stubSiteverify(false);
+        const qs = new URLSearchParams({ cheq_challenge: '1', 'cf-turnstile-response': 'bad-token', 'cheq_original_url': '/page?gclid=1' }).toString();
+        const result = await challenge(buildTurnstileRequest(qs, 'example.com'), buildRTIResponse()) as any;
+        expect(result.status).toBe('403');
+        expect(result.body).toContain('class="cf-turnstile"');
+        expect(result.body).toContain('role="alert"');
+        expect(result.body).toContain('name="cheq_original_url" id="cheq-original-url" value="/page?gclid=1"');
+        expect(result.headers['cache-control'][0].value).toContain('no-store');
+    });
+
+    // Issue 9: hostname, action, Referer
+
+    it.each([
+        ['another action', { action: 'login' }],
+        ['no action', { action: undefined }],
+        ['another hostname', { hostname: 'evil.example' }],
+    ])('refuses a valid token with %s', async (_label, answer) => {
+        stubSiteverify(true, answer);
+        const result = await challenge(buildTurnstileRequest(solvedQuery, 'example.com'), buildRTIResponse()) as any;
+        expect(result.status).toBe('403');
+        expect(result.headers['set-cookie']).toBeUndefined();
+    });
+
+    it('sets data-action on the widget', async () => {
+        const result = await challenge(buildTurnstileRequest(), buildRTIResponse()) as any;
+        expect(result.body).toContain('data-action="cheq-challenge"');
+    });
+
+    it('sends Referrer-Policy: no-referrer and no-store on the challenge page and the 302', async () => {
+        const page = await challenge(buildTurnstileRequest(), buildRTIResponse()) as any;
+        stubSiteverify(true);
+        const redirect = await challenge(buildTurnstileRequest(solvedQuery, 'example.com'), buildRTIResponse()) as any;
+        for (const result of [page, redirect]) {
+            expect(result.headers['referrer-policy'][0].value).toBe('no-referrer');
+            expect(result.headers['cache-control'][0].value).toContain('no-store');
+        }
+    });
+
+    // Issue 10: debug logs, strict expiry, User-Agent binding
+
+    it('never logs the cookie or session token in debug mode', async () => {
+        const { cookie, token } = await issueSession('ray-log');
+        const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+        await validateChallenge(buildRequest(cookie), true);
+        const logged = consoleSpy.mock.calls.flat().join('\n');
+        expect(logged).not.toContain(token);
+        expect(logged).not.toContain(token.split('.')[1]);
+    });
+
+    it.each(['abc', '17e5', '1.5', '-1'])('rejects a session whose expiry is %j followed by a valid-looking signature', async (expiry) => {
+        const { signature } = await issueSession('ray-x');
+        expect(await validateChallenge(buildRequest(`_cq_se=${expiry}.${signature}|ray-x`), false)).toBe(false);
+    });
+
+    it('rejects an expiry with trailing junk that parseInt would have accepted', async () => {
+        const { expiresAt, signature } = await issueSession('ray-x');
+        expect(await validateChallenge(buildRequest(`_cq_se=${expiresAt}abc.${signature}|ray-x`), false)).toBe(false);
+    });
+
+    it('binds the session to the User-Agent that solved the challenge', async () => {
+        stubSiteverify(true);
+        const issued = await challenge(withUa(buildTurnstileRequest(solvedQuery), 'Browser A'), buildRTIResponse('ray-ua')) as any;
+        const cookie = issued.headers['set-cookie'][0].value.split(';')[0];
+        expect(await validateChallenge(withUa(buildRequest(cookie), 'Browser A'), false)).toBe(true);
+        expect(await validateChallenge(withUa(buildRequest(cookie), 'python-requests/2.31'), false)).toBe(false);
+    });
+
+    // The challenge's own parameters never nest into the return URL
+
+    it('drops stale cf-turnstile-response / cheq_original_url / cheq_request_id from the return URL, keeps the rest', async () => {
+        const qs = new URLSearchParams({ cheq_original_url: '/shop', cheq_request_id: 'ray-old', gclid: '1', utm_source: 'ad' }).toString();
+        const result = await challenge(buildTurnstileRequest(qs), buildRTIResponse()) as any;
+        expect(result.body).toContain('name="cheq_original_url" id="cheq-original-url" value="/page?gclid=1&amp;utm_source=ad"');
+        expect(result.body).not.toContain('ray-old');
+    });
+
+    it('returns to the bare path when only challenge parameters were in the query', async () => {
+        const result = await challenge(buildTurnstileRequest('cheq_original_url=%2Fshop&cheq_request_id=r1'), buildRTIResponse()) as any;
+        expect(result.body).toContain('name="cheq_original_url" id="cheq-original-url" value="/page"');
+    });
+
+    // Hostname check on origin-request, where Host may be the origin's domain
+
+    const originHostRequest = (qs: string) => buildTurnstileRequest(qs, 'alb-123.us-east-1.elb.amazonaws.com');
+
+    it('without allowedHostnames, a token solved on the viewer host is refused when the Lambda sees the origin Host (documents G11)', async () => {
+        stubSiteverify(true, { hostname: 'www.shop.com' });
+        const result = await challenge(originHostRequest(solvedQuery), buildRTIResponse()) as any;
+        expect(result.status).toBe('403');
+        expect(result.headers['set-cookie']).toBeUndefined();
+    });
+
+    it('with allowedHostnames, accepts a token solved on a listed host and redirects there, not to the Host header', async () => {
+        stubSiteverify(true, { hostname: 'www.shop.com' });
+        const qs = new URLSearchParams({ cheq_challenge: '1', 'cf-turnstile-response': 'valid-token', cheq_original_url: '/products/1?gclid=9' }).toString();
+        const result = await build({ ...testSettings, allowedHostnames: ['shop.com', 'www.shop.com'] }).challenge(originHostRequest(qs), buildRTIResponse()) as any;
+        expect(result.status).toBe('302');
+        expect(result.headers.location[0].value).toBe('https://www.shop.com/products/1?gclid=9');
+        expect(result.headers['set-cookie'][0].value).toContain('_cq_se=');
+    });
+
+    it.each([
+        ['another hostname', { hostname: 'evil.example' }],
+        ['no hostname', { hostname: undefined }],
+    ])('with allowedHostnames, refuses a token with %s', async (_label, answer) => {
+        stubSiteverify(true, answer);
+        const result = await build({ ...testSettings, allowedHostnames: ['www.shop.com'] }).challenge(originHostRequest(solvedQuery), buildRTIResponse()) as any;
+        expect(result.status).toBe('403');
+    });
+
+    it('treats an empty allowedHostnames list as unset (Host header check applies)', async () => {
+        stubSiteverify(true); // hostname example.com
+        const result = await build({ ...testSettings, allowedHostnames: [] }).challenge(buildTurnstileRequest(solvedQuery, 'example.com'), buildRTIResponse()) as any;
+        expect(result.status).toBe('302');
+        expect(result.headers.location[0].value).toBe('https://example.com/page');
+    });
+
+    // POST-based verification, cheq_ parameter names, raw query, fragment
+
+    const postAnswer = (form: Record<string, string>, host = 'example.com', query = 'cheq_challenge=1'): CloudFrontRequest => {
+        const request = buildTurnstileRequest(query, host);
+        (request as any).method = 'POST';
+        (request as any).body = { data: Buffer.from(new URLSearchParams(form).toString()).toString('base64'), encoding: 'base64', inputTruncated: false };
+        return request;
+    };
+
+    it('serves a POST form by default, marked in the action query, with cheq_-prefixed fields', async () => {
+        const result = await challenge(buildTurnstileRequest('gclid=1'), buildRTIResponse('ray-1')) as any;
+        expect(result.body).toContain('action="/page?cheq_challenge=1&amp;cheq_original_url=%2Fpage%3Fgclid%3D1" method="POST"');
+        expect(result.body).toContain('name="cheq_original_url" id="cheq-original-url" value="/page?gclid=1"');
+        expect(result.body).toContain('name="cheq_request_id" value="ray-1"');
+        expect(result.body).not.toContain('name="original_url"');
+    });
+
+    it('serves a GET form with a bare action when submitMethod is "GET"', async () => {
+        const result = await build({ ...testSettings, submitMethod: 'GET' }).challenge(buildTurnstileRequest('gclid=1'), buildRTIResponse()) as any;
+        expect(result.body).toContain('action="/page" method="GET"');
+    });
+
+    it('verifies a POSTed answer from the base64 body and redirects to the original URL, query and fragment intact', async () => {
+        const post = stubSiteverify(true);
+        const result = await challenge(postAnswer({ 'cf-turnstile-response': 'tok-1', cheq_original_url: '/page?a=1&a=2&q=hello%20world#top', cheq_request_id: 'r' }), buildRTIResponse()) as any;
+        expect(result.status).toBe('302');
+        expect(result.headers.location[0].value).toBe('https://example.com/page?a=1&a=2&q=hello%20world#top');
+        expect(result.headers['set-cookie'][0].value).toContain('_cq_se=');
+        expect(siteverifyBody(post).response).toBe('tok-1');
+    });
+
+    it('falls back to the return URL in the action query when the POST body lacks it', async () => {
+        stubSiteverify(true);
+        const result = await challenge(postAnswer({ 'cf-turnstile-response': 'tok-1' }, 'example.com', 'cheq_challenge=1&cheq_original_url=%2Fshop%3Fx%3D1'), buildRTIResponse()) as any;
+        expect(result.headers.location[0].value).toBe('https://example.com/shop?x=1');
+    });
+
+    it('answers a POST without a body (IncludeBody off) with a GET form and an error, and logs it', async () => {
+        const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+        const request = buildTurnstileRequest('cheq_challenge=1&cheq_original_url=%2Fshop%3Fx%3D1', 'example.com');
+        (request as any).method = 'POST';
+        const result = await challenge(request, buildRTIResponse()) as any;
+        expect(result.status).toBe('403');
+        expect(result.body).toContain('method="GET"');
+        expect(result.body).toContain('name="cheq_original_url" id="cheq-original-url" value="/shop?x=1"');
+        expect(result.body).toContain('role="alert"');
+        expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining('IncludeBody'));
+    });
+
+    it('treats a POST with an empty body as a missing token: POST retry page, no IncludeBody error', async () => {
+        const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+        const request = buildTurnstileRequest('cheq_challenge=1&cheq_original_url=%2Fshop%3Fx%3D1', 'example.com');
+        (request as any).method = 'POST';
+        (request as any).body = { data: '', encoding: 'base64', inputTruncated: false };
+        const result = await challenge(request, buildRTIResponse()) as any;
+        expect(result.status).toBe('403');
+        expect(result.body).toContain('method="POST"');
+        expect(result.body).toContain('name="cheq_original_url" id="cheq-original-url" value="/shop?x=1"');
+        expect(errorSpy).not.toHaveBeenCalled();
+    });
+
+    it('keeps the return URL from the form when a POSTed answer has no token (widget reset before submit)', async () => {
+        const result = await challenge(postAnswer({ cheq_original_url: '/page?gclid=1&utm_source=ad' }), buildRTIResponse()) as any;
+        expect(result.status).toBe('403');
+        expect(result.body).toContain('name="cheq_original_url" id="cheq-original-url" value="/page?gclid=1&amp;utm_source=ad"');
+    });
+
+    it('ignores a stale token in a GET without the marker: serves the widget, no siteverify call', async () => {
+        const post = stubSiteverify(true);
+        const result = await challenge(buildTurnstileRequest('cf-turnstile-response=stale&gclid=1'), buildRTIResponse()) as any;
+        expect(result.status).toBe('403');
+        expect(result.body).toContain('name="cheq_original_url" id="cheq-original-url" value="/page?gclid=1"');
+        expect(post).not.toHaveBeenCalled();
+    });
+
+    it('marks the GET form with cheq_challenge=1 as a hidden field', async () => {
+        const result = await challenge(buildTurnstileRequest('gclid=1'), buildRTIResponse(), undefined) as any;
+        const getForm = await challenge(buildTurnstileRequest('cheq_challenge=1&cheq_original_url=%2Fpage', 'example.com'), buildRTIResponse()) as any;
+        expect(result.body).not.toContain('name="cheq_challenge"');
+        expect(getForm.body).toContain('method="POST"');
+        const request = buildTurnstileRequest('cheq_challenge=1', 'example.com');
+        (request as any).method = 'POST';
+        vi.spyOn(console, 'error').mockImplementation(() => {});
+        const fallback = await challenge(request, buildRTIResponse()) as any;
+        expect(fallback.body).toContain('method="GET"');
+        expect(fallback.body).toContain('name="cheq_challenge" value="1"');
+    });
+
+    it('logs why siteverify rejected a token (codes, action, hostname), never the token', async () => {
+        const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+        vi.spyOn(HttpsClient.prototype, 'post').mockResolvedValue({ status: 200, statusText: 'OK', body: JSON.stringify({ success: false, 'error-codes': ['invalid-input-secret'] }) } as any);
+        const result = await challenge(postAnswer({ 'cf-turnstile-response': 'secret-token-value', cheq_original_url: '/page' }), buildRTIResponse()) as any;
+        expect(result.status).toBe('403');
+        expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining('invalid-input-secret'));
+        expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining('expected=example.com'));
+        expect(errorSpy.mock.calls.flat().join(' ')).not.toContain('secret-token-value');
+    });
+
+    it('shows the retry page again (POST form) when a POSTed token fails', async () => {
+        stubSiteverify(false);
+        const result = await challenge(postAnswer({ 'cf-turnstile-response': 'bad', cheq_original_url: '/page?gclid=1' }), buildRTIResponse()) as any;
+        expect(result.status).toBe('403');
+        expect(result.body).toContain('role="alert"');
+        expect(result.body).toContain('method="POST"');
+        expect(result.body).toContain('value="/page?gclid=1"');
+    });
+
+    it.each([
+        ['POST with the marker', 'POST', 'cheq_challenge=1', true],
+        ['POST without the marker (a normal form)', 'POST', 'return=%2Faccount', false],
+        ['GET with the marker and a token (GET form)', 'GET', 'cheq_challenge=1&cf-turnstile-response=x', true],
+        ['GET with a token but no marker (crafted or foreign link)', 'GET', 'cf-turnstile-response=x', false],
+        ['GET with the marker but an empty token', 'GET', 'cheq_challenge=1&cf-turnstile-response=', false],
+        ['GET without a token', 'GET', 'gclid=1', false],
+        ['PUT with the marker', 'PUT', 'cheq_challenge=1', false],
+    ])('isChallengeAnswer: %s → %s', (_label, method, query, expected) => {
+        const request = buildTurnstileRequest(query);
+        (request as any).method = method;
+        expect(build(testSettings).isChallengeAnswer!(request)).toBe(expected);
+    });
+
+    it('keeps the query string raw: percent-encoding, +, duplicate names and order', async () => {
+        const result = await challenge(buildTurnstileRequest('q=hello%20world&a=1&b=x+y&a=2&x=%2F%3F'), buildRTIResponse()) as any;
+        expect(result.body).toContain('value="/page?q=hello%20world&amp;a=1&amp;b=x+y&amp;a=2&amp;x=%2F%3F"');
+    });
+
+    it('does not strip the site\'s own original_url / request_id parameters (only the cheq_ ones)', async () => {
+        const result = await challenge(buildTurnstileRequest('original_url=keep&request_id=keep&cheq_request_id=old&gclid=3'), buildRTIResponse()) as any;
+        expect(result.body).toContain('value="/page?original_url=keep&amp;request_id=keep&amp;gclid=3"');
+    });
+
+    it('carries the fragment from the browser into the return URL (client-side script)', async () => {
+        const result = await challenge(buildTurnstileRequest(), buildRTIResponse()) as any;
+        expect(result.body).toContain("if (location.hash && originalUrl.value.indexOf('#') === -1) { originalUrl.value += location.hash; }");
+    });
+
+    // Issue 12: challenge page load and spinner
+
+    it('loads no Google Fonts and preconnects to Turnstile', async () => {
+        const result = await challenge(buildTurnstileRequest(), buildRTIResponse()) as any;
+        expect(result.body).not.toContain('fonts.googleapis.com');
+        expect(result.body).toContain('<link rel="preconnect" href="https://challenges.cloudflare.com">');
+    });
+
+    it('resets the spinner on bfcache restore and on widget error, expiry or timeout', async () => {
+        const result = await challenge(buildTurnstileRequest(), buildRTIResponse()) as any;
+        expect(result.body).toContain("addEventListener('pageshow'");
+        for (const cb of ['data-error-callback', 'data-expired-callback', 'data-timeout-callback']) {
+            expect(result.body).toContain(`${cb}="onTurnstileReset"`);
+        }
     });
 });

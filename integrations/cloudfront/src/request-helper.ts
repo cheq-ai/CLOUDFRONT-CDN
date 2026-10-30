@@ -11,6 +11,7 @@ import { Action } from '../../core/models/action.model';
 import { ActionStrategy } from '../../core/models/action-strategy.model';
 import { Ids, RTIResponse } from '../../core/models/rti-response.model';
 import { generateDefaultBlockPage } from '../../core/helpers/block-page-helpers';
+import { Mode } from '../../core/models/mode.model';
 
 export enum RequestType {
   VIEWER_REQUEST,
@@ -99,6 +100,12 @@ export const handle = async (event: CloudFrontRequestEvent, requestType: Request
             await logger.info(`rti_duration: ${Date.now() - startRTI}`);
         }
 
+        // A request that carries a solved challenge (config.isChallengeAnswer, e.g. the Turnstile form POST) is always
+        // handled by the challenge, whatever the verdict: with ALLOW it must not reach the origin as a stray form
+        // submission, and under the CAPTCHA strategy it is verified although other POSTs are never challenged.
+        // Block, 404 and redirect still win.
+        const challengeAnswer = config.challenge !== undefined && (config.isChallengeAnswer?.(cfRequest) ?? false);
+
         // Get action from RTI response and handle accordingly
         const action = rtiHelperService.getAction(rtiResponse);
 
@@ -119,13 +126,13 @@ export const handle = async (event: CloudFrontRequestEvent, requestType: Request
                 case ActionStrategy.ACCESS_DENIED:
                     return {
                         status: '403',
-                        headers: { 'content-type': [{ key: 'Content-Type', value: 'text/html;charset=UTF-8' }] },
+                        headers: { 'content-type': [{ key: 'Content-Type', value: 'text/html;charset=UTF-8' }], ...noStore },
                         body: generateDefaultBlockPage('403', 'Access Denied', rtiResponse.ids, getCfRequestId(event)),
                     };
                 case ActionStrategy.NOT_FOUND:
                     return {
                         status: '404',
-                        headers: { 'content-type': [{ key: 'Content-Type', value: 'text/html;charset=UTF-8' }] },
+                        headers: { 'content-type': [{ key: 'Content-Type', value: 'text/html;charset=UTF-8' }], ...noStore },
                         body: generateDefaultBlockPage('404', 'Not Found', rtiResponse.ids, getCfRequestId(event)),
                     };
                 case ActionStrategy.REDIRECT:
@@ -134,18 +141,30 @@ export const handle = async (event: CloudFrontRequestEvent, requestType: Request
                         'x-cheq-id': [{ key: 'x-cheq-id', value: rtiResponse.ids.rayId }],
                         'x-cheq-page-view-id': [{ key: 'x-cheq-page-view-id', value: rtiResponse.ids.pageViewId ?? '' }],
                         location: [{ key: 'location', value: config.redirectLocation || "https://www.cheq.ai/" }],
+                        ...noStore,
                     };
                     return {
                         status: '302',
                         headers,
                     };
                 case ActionStrategy.CAPTCHA:
+                    // A challenge page can only answer with a form and a 302, so a POST/PUT/... body (login,
+                    // payment, the cross-site 3DS return from the bank) would be lost. Forward it with the verdict
+                    // instead: the origin decides, and real visitors are challenged on the GET page before it.
+                    // The one POST that is handled here is the challenge's own answer form (challengeAnswer).
+                    if (!challengeAnswer && !CHALLENGEABLE_METHODS.includes(cfRequest.method)) {
+                        if (isDebugEnabled) {
+                            console.log(`${cfRequest.method} request: CAPTCHA not applicable, forwarding with x-cheq-rti-result`);
+                        }
+                        break;
+                    }
                     try {
                         if (config.challenge) {
                             // A visitor who already solved the challenge (valid _cq_se session) is not challenged
                             // again: forward with the real verdict. Only the CAPTCHA is waived, never a block,
                             // 404 or redirect. If validateChallenge throws, the catch below fails open.
-                            if (await isValidChallenge(cfRequest, isDebugEnabled)) {
+                            // An answer is verified even with a session: forwarding it would send the form to the origin.
+                            if (!challengeAnswer && await isValidChallenge(cfRequest, isDebugEnabled)) {
                                 if (isDebugEnabled) {
                                     console.log("valid challenge session, waiving CAPTCHA");
                                 }
@@ -156,21 +175,34 @@ export const handle = async (event: CloudFrontRequestEvent, requestType: Request
                         }
                         break;
                     } catch (e) {
-                        const err: Error = e as Error;
-                        const cfRequestId = getCfRequestId(event);
-                        console.error(`Challenge error handling request '${cfRequestId}':`, err);
-                        if (config.logErrors !== false) {
-                            await logger.error(`Challenge error handling request '${cfRequestId}': ${err.message}`);
-                        }
-                        return cfRequest;
+                        await reportChallengeError(getCfRequestId(event), e);
+                        return challengeAnswer ? failOpenAnswer(cfRequest) : cfRequest;
                     }
                 default:
                     break;
             }
         }
 
+        // ALLOW with a solved challenge in the request: verify and redirect, never forward the form. Not in
+        // MONITORING, which never answers a request itself: the form is sent back to its page unverified instead.
+        if (challengeAnswer && config.challenge) {
+            if (config.mode === Mode.MONITORING) {
+                return failOpenAnswer(cfRequest);
+            }
+            try {
+                return await config.challenge(cfRequest, rtiResponse, (headers) => setHeaders(headers, rtiResponse));
+            } catch (e) {
+                await reportChallengeError(getCfRequestId(event), e);
+                return failOpenAnswer(cfRequest);
+            }
+        }
+
         // action is Action.ALLOW, pass headers
         setHeaders(cfRequest.headers, rtiResponse);
+
+        if (isDebugEnabled) {
+            console.log(`forwarding to origin with x-cheq-rti-result (${Object.keys(cfRequest.headers).length} headers, body: ${cfRequest.body ? `${cfRequest.body.action ?? "no-action"}/${cfRequest.body.encoding}` : "none"})`);
+        }
 
         return cfRequest;
     } catch (e) {
@@ -185,10 +217,56 @@ export const handle = async (event: CloudFrontRequestEvent, requestType: Request
     return cfRequest;
 };
 
+// A challenge answer (the Turnstile form) cannot fail open by being forwarded: the origin would receive a stray POST.
+// It is sent back to the page it came from, without the challenge parameters, as a plain GET (302).
+function failOpenAnswer(cfRequest: CloudFrontRequest): CloudFrontRequestResult {
+    const pairs = (cfRequest.querystring || "").split("&").filter((pair) => pair !== "");
+    const nameOf = (pair: string) => decodeURIComponent(pair.split("=")[0]);
+    const isChallengeParam = (name: string) => name === "cf-turnstile-response" || name.startsWith("cheq_");
+    const original = pairs.find((pair) => nameOf(pair) === "cheq_original_url")?.split("=").slice(1).join("=");
+    let location: string | undefined;
+    if (original !== undefined) {
+        try {
+            const candidate = decodeURIComponent(original);
+            // Same-origin path only: no scheme, no "//host", no control characters.
+            if (/^\/(?!\/)/.test(candidate) && !/[\u0000-\u001f\u007f]/.test(candidate)) {
+                location = candidate;
+            }
+        } catch { /* malformed: fall back to the request's own path */ }
+    }
+    if (location === undefined) {
+        const kept = pairs.filter((pair) => !isChallengeParam(nameOf(pair)));
+        location = kept.length > 0 ? `${cfRequest.uri}?${kept.join("&")}` : cfRequest.uri;
+    }
+    return { status: '302', headers: { location: [{ key: 'Location', value: location }], ...noStore } };
+}
+
+// A challenge error is logged and the request passes through (fail-open), like every other error here.
+async function reportChallengeError(cfRequestId: string, e: unknown): Promise<void> {
+    const err: Error = e as Error;
+    console.error(`Challenge error handling request '${cfRequestId}':`, err);
+    if (config.logErrors !== false) {
+        await logger.error(`Challenge error handling request '${cfRequestId}': ${err.message}`);
+    }
+}
+
 async function isValidChallenge(cfRequest : CloudFrontRequest, isDebugEnabled: boolean | undefined): Promise<boolean> {
     const validChallenge = await config.validateChallenge?.(cfRequest, isDebugEnabled) ?? false;
     return validChallenge;
 }
+
+// `challenge` without `isChallengeAnswer` means the POSTed Turnstile answer is never recognised: it is forwarded to the
+// origin as a stray form and no session is ever issued, so every visitor is challenged forever. Say so at init.
+if (config.challenge !== undefined && config.isChallengeAnswer === undefined) {
+    console.warn("config.challenge is set but config.isChallengeAnswer is not: wire isChallengeAnswer (e.g. turnstileChallenge.isChallengeAnswer) or the challenge answer will never be verified");
+}
+
+// Only these methods can be challenged without losing the request: see the CAPTCHA case in handle().
+const CHALLENGEABLE_METHODS = ['GET', 'HEAD'];
+
+// Block and redirect answers must never be cached: on the origin-request trigger CloudFront caches what the Lambda
+// returns (403/404 for 10 s by default), so one bot's block page would be served to every visitor of that URL.
+const noStore: CloudFrontHeaders = { 'cache-control': [{ key: 'Cache-Control', value: 'no-store, no-cache, must-revalidate' }] };
 
 function getRequestUrl(cfRequest : CloudFrontRequest): URL {
     const host = (cfRequest.headers["host"]?.map((kv) => kv.value) || "").join(', ');

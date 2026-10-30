@@ -35,6 +35,14 @@ export interface CloudfrontConfig extends Config {
     validateChallenge?: (request: CloudFrontRequest, isDebug: boolean | undefined) => Promise<boolean>;
 
     /**
+     * Tells the handler that a request carries a solved challenge (for the example: the Turnstile form POST, or a GET
+     * with the token). Such a request is always passed to `challenge` for verification, whatever the verdict, and is
+     * never forwarded to the origin as a stray form submission.
+     * @param request
+     */
+    isChallengeAnswer?: (request: CloudFrontRequest) => boolean;
+
+    /**
      * The list of headers to keep in the request that will be sent to RTI. 
      * This is optional and can be used to reduce the size of the request if there are many headers that are not needed. 
      * If not provided (meaning empty array, null or undefined are not allowed), all headers will be kept.
@@ -75,6 +83,7 @@ export const config: CloudfrontConfig = {
 
     challenge: turnstileChallenge.challenge,
     validateChallenge: turnstileChallenge.validateChallenge,
+    isChallengeAnswer: turnstileChallenge.isChallengeAnswer,
 
     // Example for ignored paths
     ignorePaths: [

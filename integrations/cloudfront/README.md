@@ -298,7 +298,7 @@ After deployment, SAM outputs the Lambda version ARNs and origin request policy 
 > **Note:** Origin request policies are only relevant for the **origin-request** trigger. The viewer-request trigger always receives all viewer headers automatically — no origin request policy is needed. You can use those policies but probably you like to control them yourself for your origin.
 
 In your CloudFront distribution → **Behaviors** → **Edit**:
-- Set **Lambda function associations** → add the `ViewerRequestVersionARN` as the `viewer-request` trigger (recommended), or `OriginRequestVersionARN` as the `origin-request` trigger
+- Set **Lambda function associations** → add the `ViewerRequestVersionARN` as the `viewer-request` trigger (recommended), or `OriginRequestVersionARN` as the `origin-request` trigger, and tick **Include body** (`IncludeBody: true`): the Turnstile answer is POSTed, and without the body the Lambda cannot read the token (it then falls back to a GET form and logs an error)
 - If using origin-request: set **Origin request policy** to the policy name that matches your origin type (see table above)
 
 ---
@@ -373,6 +373,7 @@ This one seems less important for rti v4 and kept in case it will be needed.
 |-------|------|---------|-------------|
 | `challenge` | `(request: CloudFrontRequest, response: RTIResponse, addRtiResultHeader?: (headers: CloudFrontHeaders) => void) => Promise<CloudFrontRequestResult \| CloudFrontResponseResult>` | `undefined` | Called when action strategy is `CAPTCHA` (and the visitor has no valid session). Receives the full CloudFront request and RTI response. Must return a CloudFront response (e.g. challenge page) or the request (pass-through). `addRtiResultHeader` sets `x-cheq-rti-result` on the headers you pass it; call it on the responses that should carry the verdict (the example does so only on the 302 after a solved challenge). See `turnstile-challenge-example.ts` for a reference implementation. |
 | `validateChallenge` | `(request: CloudFrontRequest, isDebug?: boolean) => Promise<boolean>` | `undefined` | Called only when the RTI action strategy is `CAPTCHA` and `challenge` is set. Return `true` when the visitor already solved the challenge (e.g. a valid session cookie): the challenge is waived and the request is forwarded with `x-cheq-rti-result` carrying the real verdict. It does **not** skip RTI: every request still gets a verdict. Only the `CAPTCHA` strategy is waived: `ACCESS_DENIED`, `NOT_FOUND` and `REDIRECT` are always enforced. If you set `blockingStrategy: CAPTCHA`, a valid session also waives blocked (malicious) traffic. If it throws, the request is passed through without the header (fail-open). |
+| `isChallengeAnswer` | `(request: CloudFrontRequest) => boolean` | `undefined` | Tells the handler that a request carries a solved challenge (the example: a POST marked `?cheq_challenge=1`, or a GET with that marker and a non-empty token). Such a request is always passed to `challenge`, whatever the verdict (never in MONITORING, where it is sent back to its page by a 302; and if `challenge` throws, the answer fails open by that same 302, never by forwarding the form) — with ALLOW it must not reach the origin as a stray form submission, and it is verified although other POSTs are never challenged. Block, 404 and redirect still win. |
 | `keepHeadersNames` | `string[]` | — | **Required** (pass `[]` to send all headers). When non-empty, only these header names are sent to RTI, on both triggers. Useful for reducing payload size when only certain headers are relevant. On origin-request, the origin request policy also limits which headers exist in the first place. |
 
 ### Network & Endpoints
@@ -796,6 +797,12 @@ Add TrustedIP variant if you need an additional custom header forwarded (set via
 Use AllHeadersAllowed during development/testing for maximum visibility. The exact use case for TrustedIPHeader is unclear — carried over from the old repo without documentation.
 ```
 
+### The `x-cheq-rti-result` header must be allowed by the policy
+
+CloudFront applies the behaviour's origin request policy to the request that reaches the origin, **including headers added by an origin-request Lambda**. With a whitelist policy that does not list `x-cheq-rti-result`, the header set by the Lambda reaches the origin only intermittently; with the header whitelisted, or with an all-viewer-headers policy, it arrives on every request. The policies in `template.yaml` therefore list `x-cheq-rti-result`. The quota is **10 headers per policy**, so `true-client-ip` was dropped to make room (it only carries a client IP when another CDN sits in front of CloudFront, which `x-forwarded-for` also covers). If you use your own policy on the behaviour, add `x-cheq-rti-result` to it, or the origin will not see the verdict. The same applies on viewer-request: the header added there also passes through the policy.
+
+**Trust the header only where the Lambda runs.** A policy that allows `x-cheq-rti-result` forwards a *viewer-supplied* `x-cheq-rti-result` too; the Lambda strips it before adding its own, but only on behaviours it is attached to. Use such a policy only on CHEQ-protected behaviours, or strip the header at the origin on other paths, or the origin may act on a forged verdict sent on `/api/*` or `/static/*`.
+
 ### Why Policies Matter for RTI
 
 The RTI API uses HTTP headers (user-agent, accept-language, referer, TLS fingerprints, etc.) as signals for bot detection. The more headers available in the Lambda, the higher the detection accuracy. The origin request policy whitelists the specific headers that CloudFront will forward to the Lambda.
@@ -822,7 +829,11 @@ The settings live in the `turnstile` block at the top of [`src/config.ts`](src/c
 
 `sessionTtlSeconds` (default 300) sets how long a solved challenge is remembered. It must be a positive whole number of seconds; any other value (0, negative, fractional, a string) logs a warning and 300 is used.
 
-`config.ts` passes them to `createTurnstileChallenge(turnstile)`, which returns `challenge` and `validateChallenge`. Until all three secrets are set (not empty, not `REPLACE_ME`) it returns neither and logs a warning once per cold start: the CAPTCHA is disabled, and challenged traffic is forwarded to the origin with `x-cheq-rti-result`.
+`allowedHostnames` (optional, e.g. `["www.example.com"]`) lists the hostnames the challenge page is served on. Cloudflare reports the hostname a token was solved on; it must be one of these, and the redirect after the challenge goes there. Leave it unset on **viewer-request**: the request's Host header is used. Set it on **origin-request** when the origin request policy does not forward `host` (the `-no-host` policies): the Lambda then sees the origin's own domain, so without the list every verification fails and the redirect would point at the origin.
+
+`submitMethod` (optional, default `"POST"`) is how the solved widget is sent back. `"POST"` keeps the single-use Turnstile token out of the URL, browser history, logs and Referer, and needs **`IncludeBody: true`** on the Lambda@Edge association (and POST allowed on the behaviour). `"GET"` needs nothing but puts the token in the URL. A POSTed answer that arrives without a body is answered with a GET form plus an error in the logs, so a missing IncludeBody never traps visitors.
+
+`config.ts` passes them to `createTurnstileChallenge(turnstile)`, which returns `challenge`, `validateChallenge` and `isChallengeAnswer`; wire all three into `config`. Until all three secrets are set (not empty, not `REPLACE_ME`) it returns neither and logs a warning once per cold start: the CAPTCHA is disabled, and challenged traffic is forwarded to the origin with `x-cheq-rti-result`.
 
 ### How the Challenge Flow Works
 
@@ -830,32 +841,49 @@ The settings live in the `turnstile` block at the top of [`src/config.ts`](src/c
 Request arrives → RTI verdict triggers CHALLENGE → config.challenge() called
         │
         ▼
- Does the request have a `cf-turnstile-response` query parameter?
+ Does the request carry a solved widget? (a POST marked `?cheq_challenge=1` with the form in the body — default —
+ or, with `submitMethod: "GET"`, a GET carrying `cheq_challenge=1` and a non-empty `cf-turnstile-response`; a link with only the token is an ordinary request)
         │
    NO ──┤──► Return HTTP 403 with CAPTCHA challenge page
         │       (Turnstile widget + hidden form)
         │       User solves the CAPTCHA
         │       Turnstile widget injects hidden `cf-turnstile-response` input into the form
-        │       Form submits (GET) back to same URL with token appended
+        │       Form submits (POST, body) to the same path: `?cheq_challenge=1&cheq_original_url=…`
+        │       (CloudFront passes the body only with IncludeBody: true on the association;
+        │        without it the Lambda answers with a GET form and logs an error, so nobody is stuck)
         │
    YES ──► POST token to Cloudflare siteverify API (server-side)
                │
-          Verification fails ──► Return 403 "Verification failed" (plain text, no widget;
-                                  see Troubleshooting: "Verification failed" after refresh)
+          siteverify times out (1.5 s), errors or answers non-JSON ──► throws: the handler fails open
+          Verification fails, or the token is for another action/hostname ──► 403 challenge page again
+                                  with a "Verification failed" message and a fresh widget (no-store)
                │
           Verification passes
                │
                ▼
           Generate signed session token:
-          "{expiresAt}.{HMAC-SHA256(sessionSigningSecret, ["se", expiresAt, rayId])[0:32 hex]}"
+          "{expiresAt}.{HMAC-SHA256(sessionSigningSecret, ["se", expiresAt, rayId, userAgent])[0:32 hex]}"
                │
                ▼
-          Return HTTP 302 redirect to original URL
+          Return HTTP 302 redirect to original URL, including its query string (Cache-Control: no-store,
+          Referrer-Policy: no-referrer)
           (host from the Host header, never the query string; original_url must be a
            same-site path, otherwise the request URI is used)
           Set-Cookie: _cq_se={token}|{rayId}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=300
           x-cheq-rti-result: version=…;verdict=…;threat-type-code=…;ids={…}
 ```
+
+### What survives the challenge, and what does not
+
+| Part of the original request | After the challenge |
+|---|---|
+| Path and query string | Kept **verbatim**: percent-encoding, `+`, duplicate names and order are untouched (the return URL is carried in `cheq_original_url`; only the challenge's own `cheq_*` / `cf-turnstile-response` parameters are removed). A site's own `original_url` / `request_id` parameters are not touched. |
+| Fragment (`#section`) | Kept: the page script appends `location.hash` to the return URL (the server never sees fragments). |
+| Protocol / host / port | Host from the request (or `allowedHostnames`); always `https`; CloudFront serves no custom ports. |
+| Cookies | Untouched; `_cq_se` is added. |
+| Request body | A POST is never challenged (forwarded with the verdict), so bodies are never lost. The only POST the challenge consumes is its own answer form. |
+| Referer | **Lost across the interstitial**, as with every CAPTCHA product: the redirected request's referrer can only be the challenge page, and `Referrer-Policy: no-referrer` keeps even that out. Attribution parameters in the query (`gclid`, `utm_*`) are the reliable carrier and are kept. |
+| Redirect chains | The session cookie (`Path=/`) is sent on every hop, so an origin-side redirect after the challenge is not challenged again. |
 
 > **The 302 carries `x-cheq-rti-result`.** The example adds it with the `addRtiResultHeader` function the handler passes to
 > `challenge`. It is a response to the **browser**, not the origin, so the client (bots included) can read the verdict,
@@ -878,11 +906,13 @@ Split token → {expiresAt}.{signature}
      │
      ├── expired? (Date.now() > expiresAt) → return false (challenged again)
      │
-     └── Recompute HMAC(sessionSigningSecret, ["se", expiresAt, rayId]), constant-time compare
+     └── Recompute HMAC(sessionSigningSecret, ["se", expiresAt, rayId, userAgent]), constant-time compare
               │
          Matches? → return true (CAPTCHA waived: forwarded with x-cheq-rti-result, real verdict)
          No match? → return false (challenged again)
 ```
+
+Only `GET` and `HEAD` requests are challenged. A `POST`, `PUT`, `PATCH`, `DELETE` or `OPTIONS` request whose strategy is `CAPTCHA` is forwarded with `x-cheq-rti-result` instead: a challenge page cannot keep a request body, so a login, a payment or a 3DS return from the bank (a cross-site `POST`, which never carries the `SameSite=Lax` session cookie) would break. Visitors are challenged on the `GET` page before it. `ACCESS_DENIED`, `NOT_FOUND` and `REDIRECT` still apply to every method.
 
 A valid session waives only the `CAPTCHA` strategy (with `blockingStrategy: CAPTCHA` that includes blocked traffic). An `ACCESS_DENIED`, `NOT_FOUND` or `REDIRECT` response is enforced as usual, and a benign verdict is forwarded
 with the header without checking the cookie. The session expiry is fixed (not extended on later requests).
@@ -897,7 +927,7 @@ _cq_se={expiresAtMs}.{hexSignature}|{rayId}
 ```
 
 - `expiresAtMs`: Unix timestamp in milliseconds (TTL default: 300 seconds)
-- `hexSignature`: first 32 hex characters of HMAC-SHA256 keyed with `sessionSigningSecret` over the JSON array `["se", expiresAtMs, rayId]`. Without the secret nobody can make a valid cookie. Cookies issued by the previous, unkeyed version (SHA-256 of `{expiresAtMs}:{rayId}`) fail validation, so those visitors are challenged once more after the upgrade.
+- `hexSignature`: first 32 hex characters of HMAC-SHA256 keyed with `sessionSigningSecret` over the JSON array `["se", expiresAtMs, rayId, userAgent]`. Without the secret nobody can make a valid cookie, and a cookie copied into a client with another User-Agent is rejected. Cookies issued before the User-Agent was added fail validation once (one more challenge after the upgrade). Cookies issued by the previous, unkeyed version (SHA-256 of `{expiresAtMs}:{rayId}`) fail validation, so those visitors are challenged once more after the upgrade.
 - **Not bound to `_cq_duid`:** on a first visit the challenge is solved before the CHEQ tag has set `_cq_duid`, so a session bound to it stopped working as soon as the cookie appeared and the visitor had to solve the CAPTCHA twice. A copied `_cq_se` cookie therefore works in another browser until it expires (`sessionTtlSeconds`).
 - `rayId`: RTI ray ID from the original BLOCK/CHALLENGE response
 
@@ -918,6 +948,9 @@ async (
   request: CloudFrontRequest,
   isDebug?: boolean
 ): Promise<boolean>
+
+// config.isChallengeAnswer (optional): true when the request carries a solved challenge
+(request: CloudFrontRequest): boolean
 ```
 
 The `challenge` function must return either:
@@ -1106,6 +1139,22 @@ For every request forwarded after an RTI verdict (ALLOW, a waived CAPTCHA, or a 
 
 **Fix:** Add the header name to `keepHeadersNames`, or set it to `[]` to forward all headers.
 
+### Block and challenge pages cached (origin-request)
+
+**Symptom:** After one bot is blocked or redirected, every visitor of that URL gets the block page or the redirect for a while.
+
+**Cause:** The Lambda answers with `Cache-Control: no-store`, but CloudFront still caches a response for the cache policy's **minimum TTL** when it is above 0, 302 responses included.
+
+**Fix:** On the origin-request trigger use a cache policy with Minimum TTL = 0 (for example `UseOriginCacheControlHeaders-QueryStrings`, as in `template.yaml`), never `CachingOptimized` or a custom policy with a minimum TTL.
+
+### Verification always fails on origin-request
+
+**Symptom:** Every visitor loops on "Verification failed", and CloudWatch shows `[turnstile] verification rejected: ... hostname=www.shop.com expected=internal-alb...`.
+
+**Cause:** The behaviour's origin request policy does not forward `host` (the `-no-host` policies), so the Lambda compares Cloudflare's hostname with the origin's.
+
+**Fix:** Set `turnstile.allowedHostnames` to the site's hostnames, exactly as the browser sees them (lowercase, no scheme, no port, no path).
+
 ### Cache bypasses RTI (origin-request)
 
 **Symptom:** Some requests reach the origin without the `x-cheq-rti-result` header.
@@ -1126,11 +1175,11 @@ A second cause: the `_cq_session` cookie name starts with `_cq_se` — the examp
 
 ### "Verification failed" after a refresh, Back, or a long wait
 
-**Symptom:** The visitor sees a plain `403 Verification failed. Please try again.` page with no widget, and refreshing shows it again.
+**Symptom:** The challenge page shows "Verification failed. Please try again." above the widget.
 
-**Cause:** The Turnstile token is single-use and expires after 300 seconds. The challenge form is sent with `GET`, so the token stays in the URL (`?cf-turnstile-response=...`). Refreshing or going Back after a successful challenge, opening a shared or bookmarked URL, or submitting the form more than 5 minutes after solving it sends a used or expired token. Cloudflare's siteverify rejects it (`timeout-or-duplicate`) and the example answers with the plain 403. Every refresh resends the same dead token.
+**Cause:** The Turnstile token is single-use and expires after 300 seconds. With the default `submitMethod: "POST"` the token is in the form body, so refresh, Back/Forward and bookmarks never resend it (a browser asks before resubmitting a POST, and the 302 target is the clean URL). With `"GET"` the token sits in the URL and a refresh or Back resends it. Either way, a used or expired token Cloudflare's siteverify rejects it (`timeout-or-duplicate`). The example then shows the widget again with the message, so the visitor solves it once more.
 
-**Fix:** The visitor can open the page without the query string (or navigate on), which gives a fresh challenge. To avoid the dead end, change the failure branch of `turnstileChallengeExample` to a `302` back to the same path **without** `cf-turnstile-response`, `original_url` and `request_id` (with `Cache-Control: no-store`), so the next request shows a fresh widget. This cannot loop by itself: the page only submits when the visitor clicks *Continue*. Log siteverify's `error-codes` when they are not `timeout-or-duplicate`; codes such as `invalid-input-secret` mean the `secretKey` in `config.ts` is wrong.
+**Fix:** Nothing to do for the visitor beyond solving the widget again. The same message appears, rarely, when the siteverify call was retried on a new connection after Cloudflare had already consumed the token (the connection's idle close crossed our request); solving again fixes it. On origin-request it appears on **every** attempt when the Lambda does not see the viewer's Host header: set `allowedHostnames` (see Setup). The token must also come from this widget (`data-action="cheq-challenge"`) on this site (siteverify `hostname` equals the request Host); Cloudflare's always-pass test secret answers `hostname: example.com` with an empty action, so it fails this check outside unit tests. Log siteverify's `error-codes` when they are not `timeout-or-duplicate`; codes such as `invalid-input-secret` mean the `secretKey` in `config.ts` is wrong.
 
 ### SAM deploy fails with `CAPABILITY_NAMED_IAM`
 
