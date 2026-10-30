@@ -10,6 +10,7 @@ const mocks = vi.hoisted(() => ({
     getActionStrategy: vi.fn(),
     getEventType: vi.fn().mockReturnValue('pageview'),
     validateChallenge: vi.fn(),
+    restoreReferer: vi.fn(),
     loggerInfo: vi.fn().mockResolvedValue(undefined),
     loggerError: vi.fn().mockResolvedValue(undefined),
     generateDefaultBlockPage: vi.fn().mockReturnValue('<html>blocked</html>'),
@@ -25,6 +26,7 @@ vi.mock('./config', () => ({
         telemetry: false,
         keepHeadersNames: [] as string[],
         validateChallenge: mocks.validateChallenge,
+        restoreReferer: mocks.restoreReferer,
         challenge: undefined as any,
         redirectLocation: 'https://www.cheq.ai/',
     },
@@ -257,6 +259,8 @@ describe('request-helper handle', () => {
         (config as any).keepHeadersNames = [];
         (config as any).challenge = undefined;
         (config as any).validateChallenge = mocks.validateChallenge;
+        (config as any).restoreReferer = mocks.restoreReferer;
+        mocks.restoreReferer.mockImplementation(() => undefined);
         (config as any).redirectLocation = 'https://www.cheq.ai/';
     });
 
@@ -268,6 +272,30 @@ describe('request-helper handle', () => {
         consoleErrorSpy.mockRestore();
         vi.restoreAllMocks(); // spies a failed test did not get to restore must not leak into the next one
         vi.unstubAllGlobals();
+    });
+
+    // --- original Referer ---
+
+    it('calls restoreReferer before RTI, so a restored Referer reaches RTI and the origin', async () => {
+        mocks.restoreReferer.mockImplementation((request: any) => {
+            request.headers['referer'] = [{ key: 'Referer', value: 'https://www.google.com/' }];
+        });
+        const event = buildEvent();
+
+        const result = await handle(event, RequestType.ORIGIN_REQUEST);
+
+        expect(mocks.restoreReferer).toHaveBeenCalledWith(event.Records[0].cf.request);
+        expect(mocks.callRTI.mock.calls[0][0].endUserParams.headers.referer).toBe('https://www.google.com/');
+        expect((result as any).headers.referer[0].value).toBe('https://www.google.com/');
+    });
+
+    it('does not call restoreReferer on ignored paths', async () => {
+        mocks.shouldIgnore.mockReturnValue(true);
+
+        await handle(buildEvent('/static/app.js'), RequestType.ORIGIN_REQUEST);
+
+        expect(mocks.restoreReferer).not.toHaveBeenCalled();
+        expect(mocks.callRTI).not.toHaveBeenCalled();
     });
 
     // --- RTI ALLOW ---

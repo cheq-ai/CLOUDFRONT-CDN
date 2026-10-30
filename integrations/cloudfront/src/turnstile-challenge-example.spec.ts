@@ -1,7 +1,7 @@
 // cspell:ignore cheq
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
-import { createTurnstileChallenge, TurnstileSettings } from './turnstile-challenge-example';
+import { createTurnstileChallenge, restoreOriginalReferer, TurnstileSettings } from './turnstile-challenge-example';
 import type { CloudFrontRequest } from 'aws-lambda/common/cloudfront';
 import type { RTIResponse } from '../../core/models/rti-response.model';
 import { HttpsClient } from '../../core/services/https-client';
@@ -859,5 +859,103 @@ describe('challenge flow hardening', () => {
         for (const cb of ['data-error-callback', 'data-expired-callback', 'data-timeout-callback']) {
             expect(result.body).toContain(`${cb}="onTurnstileReset"`);
         }
+    });
+});
+
+describe('original Referer (carried in _cq_ref, restored after the challenge)', () => {
+    const REF = 'https://www.google.com/search?q=shoes';
+    const withReferer = (request: CloudFrontRequest, referer: string) => {
+        request.headers['referer'] = [{ key: 'Referer', value: referer }];
+        return request;
+    };
+    const carried = `_cq_ref=${encodeURIComponent('/page?utm_source=google')}|${encodeURIComponent(REF)}`;
+
+    it('challenge page carries the Referer of the interrupted request in _cq_ref, bound to the return URL, readable by the page', async () => {
+        const result = await challenge(withReferer(buildTurnstileRequest('utm_source=google', 'example.com'), REF), buildRTIResponse()) as any;
+        expect(result.headers['set-cookie']).toHaveLength(1);
+        expect(result.headers['set-cookie'][0].value).toBe(`${carried}; Path=/; Secure; SameSite=Lax; Max-Age=1800`);
+    });
+
+    it('sets no _cq_ref when the interrupted request had no Referer', async () => {
+        const result = await challenge(buildTurnstileRequest('utm_source=google', 'example.com'), buildRTIResponse()) as any;
+        expect(result.headers['set-cookie']).toBeUndefined();
+    });
+
+    it.each(['javascript:alert(1)', 'ftp://files.example/x', 'https://x.example/\u0000', 'https://x.example/a b', `https://x.example/${'a'.repeat(2100)}`])(
+        'ignores an unusable Referer %j', async (referer) => {
+            const result = await challenge(withReferer(buildTurnstileRequest('', 'example.com'), referer), buildRTIResponse()) as any;
+            expect(result.headers['set-cookie']).toBeUndefined();
+        });
+
+    it('does not set _cq_ref on the retry page: an answer\'s Referer is the challenge page, not the visitor\'s source', async () => {
+        stubSiteverify(false);
+        const qs = new URLSearchParams({ cheq_challenge: '1', 'cf-turnstile-response': 'bad-token', cheq_original_url: '/page?utm_source=google' }).toString();
+        const result = await challenge(withReferer(buildTurnstileRequest(qs, 'example.com'), 'https://example.com/page?utm_source=google'), buildRTIResponse()) as any;
+        expect(result.status).toBe('403');
+        expect(result.headers['set-cookie']).toBeUndefined();
+    });
+
+    it('the 302 after a solved challenge keeps the carried Referer only for the redirect (120 s)', async () => {
+        stubSiteverify(true);
+        const qs = new URLSearchParams({ cheq_challenge: '1', 'cf-turnstile-response': 'valid-token', cheq_original_url: '/page?utm_source=google' }).toString();
+        const result = await challenge(buildTurnstileRequest(qs, 'example.com', carried), buildRTIResponse()) as any;
+        expect(result.status).toBe('302');
+        expect(result.headers['set-cookie']).toHaveLength(2);
+        expect(result.headers['set-cookie'][0].value).toMatch(/^_cq_se=/);
+        expect(result.headers['set-cookie'][1].value).toBe(`${carried}; Path=/; Secure; SameSite=Lax; Max-Age=120`);
+    });
+
+    describe('restoreOriginalReferer', () => {
+        const request = (querystring: string, cookie?: string, referer?: string) => {
+            const r = buildTurnstileRequest(querystring, 'example.com', cookie);
+            return referer ? withReferer(r, referer) : r;
+        };
+        const refererOf = (r: CloudFrontRequest) => r.headers['referer']?.[0]?.value;
+
+        it('restores the Referer on the page the challenge was served for when the request has none', () => {
+            const r = request('utm_source=google', carried);
+            expect(restoreOriginalReferer(r)).toBe(true);
+            expect(r.headers['referer']).toEqual([{ key: 'Referer', value: REF }]);
+        });
+
+        it('replaces a Referer that is the page itself (what a browser sends after the challenge, or on a reload)', () => {
+            const r = request('utm_source=google', carried, 'https://example.com/page?utm_source=google');
+            expect(restoreOriginalReferer(r)).toBe(true);
+            expect(refererOf(r)).toBe(REF);
+        });
+
+        it('keeps a Referer from another page', () => {
+            const r = request('utm_source=google', carried, 'https://example.com/other');
+            expect(restoreOriginalReferer(r)).toBe(false);
+            expect(refererOf(r)).toBe('https://example.com/other');
+        });
+
+        it('does nothing on another URL than the one the challenge was served for', () => {
+            const r = request('utm_source=bing', carried);
+            expect(restoreOriginalReferer(r)).toBe(false);
+            expect(refererOf(r)).toBeUndefined();
+        });
+
+        it('does nothing without the cookie', () => {
+            const r = request('utm_source=google');
+            expect(restoreOriginalReferer(r)).toBe(false);
+            expect(refererOf(r)).toBeUndefined();
+        });
+
+        it.each([
+            '_cq_ref=nonsense',
+            '_cq_ref=|https%3A%2F%2Fa.example%2F',
+            `_cq_ref=${encodeURIComponent('/page?utm_source=google')}|javascript%3Aalert(1)`,
+            `_cq_ref=${encodeURIComponent('//evil.example/page')}|https%3A%2F%2Fa.example%2F`,
+            '_cq_ref=%E0%A4%A|https%3A%2F%2Fa.example%2F',
+        ])('ignores a malformed or unsafe cookie %j', (cookie) => {
+            const r = request('utm_source=google', cookie);
+            expect(restoreOriginalReferer(r)).toBe(false);
+            expect(refererOf(r)).toBeUndefined();
+        });
+
+        it('is wired by createTurnstileChallenge as restoreReferer', () => {
+            expect(build(testSettings).restoreReferer).toBe(restoreOriginalReferer);
+        });
     });
 });

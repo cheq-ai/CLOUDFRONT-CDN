@@ -50,6 +50,10 @@ export const handle = async (event: CloudFrontRequestEvent, requestType: Request
             return cfRequest;
         }
 
+        // A visitor coming back from a solved challenge: put the Referer of the request that was challenged back
+        // in place (the browser can only send the challenge page, or nothing) before RTI and the origin see it.
+        config.restoreReferer?.(cfRequest);
+
         // Build RTI request payload
         const startRTI = Date.now();
 

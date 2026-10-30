@@ -31,7 +31,8 @@ describe('shipped config.ts', () => {
         const challenge = vi.fn();
         const validateChallenge = vi.fn();
         const isChallengeAnswer = vi.fn();
-        const createTurnstileChallenge = vi.fn(() => ({ challenge, validateChallenge, isChallengeAnswer }));
+        const restoreReferer = vi.fn();
+        const createTurnstileChallenge = vi.fn(() => ({ challenge, validateChallenge, isChallengeAnswer, restoreReferer }));
         vi.doMock('./turnstile-challenge-example', () => ({ createTurnstileChallenge }));
 
         const config = await loadConfig();
@@ -46,6 +47,7 @@ describe('shipped config.ts', () => {
         expect(config.challenge).toBe(challenge);
         expect(config.validateChallenge).toBe(validateChallenge);
         expect(config.isChallengeAnswer).toBe(isChallengeAnswer);
+        expect(config.restoreReferer).toBe(restoreReferer);
     });
 
     it('ships safe defaults', async () => {

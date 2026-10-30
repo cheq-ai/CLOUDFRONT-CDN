@@ -870,7 +870,12 @@ Request arrives → RTI verdict triggers CHALLENGE → config.challenge() called
           (host from the Host header, never the query string; original_url must be a
            same-site path, otherwise the request URI is used)
           Set-Cookie: _cq_se={token}|{rayId}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=300
+          Set-Cookie: _cq_ref={returnPath}|{originalReferer}; Path=/; Secure; SameSite=Lax; Max-Age=120   (when carried)
           x-cheq-rti-result: version=…;verdict=…;threat-type-code=…;ids={…}
+               │
+               ▼
+          Browser requests the original URL (no Referer, or the page itself)
+          → restoreReferer puts the stored Referer back before RTI and the origin see the request
 ```
 
 ### What survives the challenge, and what does not
@@ -880,10 +885,42 @@ Request arrives → RTI verdict triggers CHALLENGE → config.challenge() called
 | Path and query string | Kept **verbatim**: percent-encoding, `+`, duplicate names and order are untouched (the return URL is carried in `cheq_original_url`; only the challenge's own `cheq_*` / `cf-turnstile-response` parameters are removed). A site's own `original_url` / `request_id` parameters are not touched. |
 | Fragment (`#section`) | Kept: the page script appends `location.hash` to the return URL (the server never sees fragments). |
 | Protocol / host / port | Host from the request (or `allowedHostnames`); always `https`; CloudFront serves no custom ports. |
-| Cookies | Untouched; `_cq_se` is added. |
+| Cookies | Untouched; `_cq_se` is added, and `_cq_ref` (the carried Referer, see below) while a challenge is open. |
 | Request body | A POST is never challenged (forwarded with the verdict), so bodies are never lost. The only POST the challenge consumes is its own answer form. |
-| Referer | **Lost across the interstitial**, as with every CAPTCHA product: the redirected request's referrer can only be the challenge page, and `Referrer-Policy: no-referrer` keeps even that out. Attribution parameters in the query (`gclid`, `utm_*`) are the reliable carrier and are kept. |
+| Referer | **Restored for RTI and the origin.** The browser can only send the challenge page as referrer (or nothing, because of `Referrer-Policy: no-referrer`), so the challenge page stores the Referer of the request it interrupted in the `_cq_ref` cookie and the Lambda puts it back on that page's next request (see *The original Referer* below). `document.referrer` in the browser cannot be restored by anyone; the page's scripts can read `_cq_ref` instead. |
 | Redirect chains | The session cookie (`Path=/`) is sent on every hop, so an origin-side redirect after the challenge is not challenged again. |
+
+### The original Referer
+
+A challenge is a detour. The request that comes back after it is a new navigation from the challenge page, so the
+only Referer a browser can send is the challenge page itself (and with `Referrer-Policy: no-referrer` on the
+challenge responses it sends none). A site that reads the Referer (traffic source attribution, affiliate tracking,
+"back to where you came from" redirects, referrer-based rules) would see every challenged visitor as coming from
+itself. The example therefore carries it:
+
+1. **Challenge page (403):** when the interrupted request has a Referer that is an absolute http(s) URL (at most
+   2048 characters), the response sets `_cq_ref={return URL}|{Referer}` (both percent-encoded; `Path=/; Secure;
+   SameSite=Lax; Max-Age=1800`). Nothing is set for a direct visit, and an answer or retry never overwrites it.
+2. **302 after a solved challenge:** the cookie is set again with `Max-Age=120`; it only has to survive the redirect.
+3. **Every request, before RTI** (`config.restoreReferer`, wired by `createTurnstileChallenge`): when the request is
+   for the URL stored in `_cq_ref` and has **no Referer or names that page itself** (what a browser sends after the
+   challenge, or on a reload), the `Referer` header is set to the stored value. RTI and the origin then see the real
+   source. A Referer from any other page is left alone, so normal navigation is never rewritten.
+
+The cookie is deliberately **not** `HttpOnly`: `document.referrer` is set by the browser from the navigation that
+produced the page and cannot be influenced by a CDN or a CAPTCHA product, so a front end that attributes the visit in
+JavaScript reads the original source from the cookie instead (the second part, after `|`, percent-decoded):
+
+```js
+const carried = document.cookie.split('; ').find(c => c.startsWith('_cq_ref='));
+const originalReferrer = carried ? decodeURIComponent(carried.split('|')[1] ?? '') : document.referrer;
+```
+
+For the origin-request trigger the origin request policy must forward cookies (CHEQ's policies forward all) and the
+`referer` header (it is in CHEQ's whitelist), as for `_cq_se`. The stored values are validated on the way back:
+the URL must be a same-site path and the Referer an absolute http(s) URL without control characters; a malformed
+cookie is ignored. A Referer is a client-supplied header in the first place, so this restores what the visitor's
+browser sent, nothing more.
 
 > **The 302 carries `x-cheq-rti-result`.** The example adds it with the `addRtiResultHeader` function the handler passes to
 > `challenge`. It is a response to the **browser**, not the origin, so the client (bots included) can read the verdict,

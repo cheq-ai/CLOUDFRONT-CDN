@@ -102,7 +102,7 @@ function isValidSessionSignature(secret: string, expiresAt: number, rayId: strin
  * the CAPTCHA is then disabled and challenged traffic is forwarded with `x-cheq-rti-result`, instead of
  * showing a broken widget or issuing sessions anyone could forge.
  */
-export function createTurnstileChallenge(settings: TurnstileSettings): Pick<CloudfrontConfig, "challenge" | "validateChallenge" | "isChallengeAnswer"> {
+export function createTurnstileChallenge(settings: TurnstileSettings): Pick<CloudfrontConfig, "challenge" | "validateChallenge" | "isChallengeAnswer" | "restoreReferer"> {
     const missing = (["siteKey", "secretKey", "sessionSigningSecret"] as const).filter(k => isPlaceholder(settings[k]));
     if (missing.length > 0) {
         console.warn(`[turnstile] CAPTCHA disabled, not configured: ${missing.join(", ")} (set them in config.ts)`);
@@ -119,6 +119,7 @@ export function createTurnstileChallenge(settings: TurnstileSettings): Pick<Clou
         challenge: (request, response, addRtiResultHeader) => turnstileChallengeExample(resolved, request, response, addRtiResultHeader),
         validateChallenge: (request, isDebug) => turnstileValidateChallengeExample(resolved, request, isDebug),
         isChallengeAnswer: isTurnstileAnswer,
+        restoreReferer: restoreOriginalReferer,
     };
 }
 
@@ -155,6 +156,66 @@ const PARAM_REQUEST_ID = "cheq_request_id";
 const PARAM_ANSWER_MARKER = "cheq_challenge";
 /** The challenge's own parameters: never carried into the return URL (a stale copy would nest inside the next one). */
 const CHALLENGE_PARAMS = [TOKEN_FIELD, PARAM_ORIGINAL_URL, PARAM_REQUEST_ID, PARAM_ANSWER_MARKER];
+
+// The original Referer. A challenge is a detour: the request that comes back after it can only carry the challenge
+// page as Referer (or none, see noStoreHeaders), so a site that reads the Referer (attribution, affiliate tracking,
+// redirects back to where the visitor came from) would see every challenged visitor as coming from itself. The
+// challenge page therefore stores the Referer of the request it interrupted in the `_cq_ref` cookie, together with
+// the URL it belongs to, and `restoreOriginalReferer` puts it back on that URL's next request before RTI and the
+// origin see it. The cookie is readable by the page's own scripts on purpose (no HttpOnly): `document.referrer`
+// cannot be restored by anyone, so a front end that needs the original source reads it from there.
+const REFERER_COOKIE = "_cq_ref";
+/** Time the visitor has to solve the challenge before the carried Referer is forgotten. */
+const REFERER_COOKIE_TTL_SECONDS = 1800;
+/** After a solved challenge the cookie only has to survive the redirect back to the page. */
+const REFERER_COOKIE_AFTER_ANSWER_SECONDS = 120;
+const MAX_REFERER_LENGTH = 2048;
+const MAX_REFERER_COOKIE_LENGTH = 3800;
+
+/** An absolute http(s) URL without whitespace or control characters, at most MAX_REFERER_LENGTH; else undefined. */
+const validReferer = (value: string | undefined): string | undefined =>
+    value !== undefined && value.length <= MAX_REFERER_LENGTH && /^https?:\/\/[^\s\u0000-\u001f\u007f]+$/i.test(value) ? value : undefined;
+
+/** The Referer header of the request, when it is a usable URL. */
+const originalRefererOf = (request: CloudFrontRequest): string | undefined => validReferer(request.headers["referer"]?.[0]?.value);
+
+/** The Set-Cookie value that carries `referer` for `returnPath`, or undefined when it would not fit in a cookie. */
+function refererCookieHeader(returnPath: string, referer: string, maxAge: number): string | undefined {
+    const value = `${REFERER_COOKIE}=${encodeURIComponent(returnPath)}|${encodeURIComponent(referer)}`;
+    return value.length <= MAX_REFERER_COOKIE_LENGTH ? `${value}; Path=/; Secure; SameSite=Lax; Max-Age=${maxAge}` : undefined;
+}
+
+/** The `_cq_ref` cookie of the request, decoded and validated; undefined when absent or malformed. */
+function refererCookieOf(request: CloudFrontRequest): { path: string; referer: string } | undefined {
+    const raw = cookieValue(requestCookies(request), REFERER_COOKIE);
+    const separator = raw?.indexOf("|") ?? -1;
+    if (raw === undefined || separator < 1) return undefined;
+    try {
+        const path = safeReturnPath(decodeURIComponent(raw.substring(0, separator)));
+        const referer = validReferer(decodeURIComponent(raw.substring(separator + 1)));
+        return path && referer ? { path, referer } : undefined;
+    } catch {
+        return undefined; // not valid percent-encoding
+    }
+}
+
+/**
+ * Puts the Referer of the request that was challenged back on the request that follows the challenge, so RTI and the
+ * origin see where the visitor really came from. Applies only to the URL the challenge was served for (carried in
+ * `_cq_ref`), and only when the request has no Referer or names the page itself (which is what a browser sends after
+ * the challenge, or on a reload). A Referer from another page is left alone. Returns whether the header was set.
+ */
+export function restoreOriginalReferer(request: CloudFrontRequest): boolean {
+    const carried = refererCookieOf(request);
+    if (!carried) return false;
+    const current = pathWithQuery(request);
+    if (carried.path !== current) return false;
+    const referer = request.headers["referer"]?.[0]?.value;
+    const host = request.headers["host"]?.[0]?.value;
+    if (referer && referer !== (host ? `https://${host}${current}` : referer)) return false;
+    request.headers["referer"] = [{ key: "Referer", value: carried.referer }];
+    return true;
+}
 
 // The name of a raw "name=value" query pair, decoded; the raw name when it is not valid percent-encoding.
 const queryPairName = (pair: string): string => {
@@ -240,8 +301,11 @@ async function siteverify(settings: TurnstileSettings, token: string, clientIp: 
  * The 403 challenge page with the Turnstile widget. `returnPath` (path + query) is where the visitor goes once solved;
  * `errorMessage` is shown above the widget after a failed verification, so the visitor can simply try again.
  */
-/** Options for the challenge page: an error to show above the widget, and the form method (default: settings.submitMethod). */
-interface ChallengePageOptions { errorMessage?: string; method?: "POST" | "GET" }
+/**
+ * Options for the challenge page: an error to show above the widget, the form method (default: settings.submitMethod),
+ * and the Referer of the interrupted request, carried in `_cq_ref` so it can be restored once the challenge is solved.
+ */
+interface ChallengePageOptions { errorMessage?: string; method?: "POST" | "GET"; originalReferer?: string }
 
 function challengePage(settings: TurnstileSettings, uri: string, returnPath: string, rayId: string, options: ChallengePageOptions = {}): CloudFrontResultResponse {
     const method = options.method ?? settings.submitMethod ?? "POST";
@@ -443,12 +507,17 @@ function challengePage(settings: TurnstileSettings, uri: string, returnPath: str
 </body>
 </html>`;
 
+    const headers: CloudFrontHeaders = {
+        'content-type': [{ key: 'Content-Type', value: 'text/html;charset=UTF-8' }],
+        ...noStoreHeaders(),
+    };
+    const refererCookie = options.originalReferer ? refererCookieHeader(returnPath, options.originalReferer, REFERER_COOKIE_TTL_SECONDS) : undefined;
+    if (refererCookie) {
+        headers['set-cookie'] = [{ key: 'Set-Cookie', value: refererCookie }];
+    }
     return {
         status: '403',
-        headers: {
-            'content-type': [{ key: 'Content-Type', value: 'text/html;charset=UTF-8' }],
-            ...noStoreHeaders(),
-        },
+        headers,
         body: html,
     };
 }
@@ -470,7 +539,9 @@ const turnstileChallengeExample = async (settings: TurnstileSettings, request: C
     if (!answer.token) {
         // Not solved yet: serve the widget. The return URL keeps the original query string (issue: ad parameters lost).
         // An answer that lost its token (widget reset before submit, empty POST) keeps the return URL it carried.
-        return challengePage(settings, request.uri, safeReturnPath(answer.originalUrl) ?? pathWithQuery(request), response.ids.rayId);
+        // Only the interrupted request itself has the visitor's Referer; an answer's Referer is the challenge page.
+        const originalReferer = isTurnstileAnswer(request) ? undefined : originalRefererOf(request);
+        return challengePage(settings, request.uri, safeReturnPath(answer.originalUrl) ?? pathWithQuery(request), response.ids.rayId, { originalReferer });
     }
 
     // Redirect back to where the visitor was, on THIS site. The host comes from the request (CloudFront only
@@ -514,6 +585,12 @@ const turnstileChallengeExample = async (settings: TurnstileSettings, request: C
         'set-cookie': [{ key: 'Set-Cookie', value: `_cq_se=${sessionToken}|${response.ids.rayId}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${ttl}` }],
         ...noStoreHeaders(),
     };
+    // The carried Referer only has to survive the redirect now: shorten its life instead of leaving it for 30 minutes.
+    const carried = refererCookieOf(request);
+    const carriedCookie = carried ? refererCookieHeader(carried.path, carried.referer, REFERER_COOKIE_AFTER_ANSWER_SECONDS) : undefined;
+    if (carriedCookie) {
+        headers['set-cookie'].push({ key: 'Set-Cookie', value: carriedCookie });
+    }
     // Adds x-cheq-rti-result (the verdict that triggered the challenge), provided by the handler. This 302 goes
     // to the BROWSER (not the origin), so the client sees verdict, threat-type-code and ids. The redirected
     // request is checked by RTI again and gets its own header on the way to the origin.

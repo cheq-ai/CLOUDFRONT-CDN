@@ -43,6 +43,14 @@ export interface CloudfrontConfig extends Config {
     isChallengeAnswer?: (request: CloudFrontRequest) => boolean;
 
     /**
+     * Called on every request before RTI is consulted. The example uses it to put the original Referer back on the
+     * request that follows a solved challenge (the browser can only send the challenge page, or nothing), so RTI
+     * and the origin see where the visitor really came from. May modify `request.headers` in place.
+     * @param request
+     */
+    restoreReferer?: (request: CloudFrontRequest) => void;
+
+    /**
      * The list of headers to keep in the request that will be sent to RTI. 
      * This is optional and can be used to reduce the size of the request if there are many headers that are not needed. 
      * If not provided (meaning empty array, null or undefined are not allowed), all headers will be kept.
@@ -84,6 +92,7 @@ export const config: CloudfrontConfig = {
     challenge: turnstileChallenge.challenge,
     validateChallenge: turnstileChallenge.validateChallenge,
     isChallengeAnswer: turnstileChallenge.isChallengeAnswer,
+    restoreReferer: turnstileChallenge.restoreReferer,
 
     // Example for ignored paths
     ignorePaths: [
